@@ -7,6 +7,7 @@ from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
+# ─── ENV ───────────────────────────────────────────────
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -14,8 +15,14 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+# ─── FLASK APP (KEEP RENDER ALIVE) ─────────────────────
 app = Flask(__name__)
 
+@app.route("/")
+def home():
+    return "Bot running 🚀"
+
+# ─── PYROGRAM BOT ──────────────────────────────────────
 bot = Client(
     "url-uploader",
     api_id=API_ID,
@@ -23,82 +30,91 @@ bot = Client(
     bot_token=BOT_TOKEN
 )
 
-user_data = {}
+# ─── USER STATE ────────────────────────────────────────
+user_state = {}
 
-@app.route("/")
-def home():
-    return "Bot running 🚀"
-
-# ─── START ────────────────────────────────────────────────
+# ─── START COMMAND ─────────────────────────────────────
 @bot.on_message(filters.command("start"))
 async def start(_, m):
+    user_state.pop(m.from_user.id, None)
     await m.reply(
         "👋 **Welcome!**\n\n"
-        "📥 Send me a video URL (m3u8/mpd/direct)\n"
-        "🎞 I’ll download it like **1DM Browser**\n\n"
-        "✅ Quality selection\n"
-        "✅ File rename\n"
-        "✅ Progress bar",
-        quote=True
+        "📥 Send a video URL (m3u8 / mpd / direct)\n"
+        "🎞 Like **1DM Browser**\n\n"
+        "✅ Quality selector\n"
+        "✅ Rename file\n"
+        "✅ Progress bar"
     )
 
-# ─── URL RECEIVED ─────────────────────────────────────────
+# ─── URL HANDLER ───────────────────────────────────────
 @bot.on_message(filters.text & ~filters.command)
-async def url_handler(_, m):
-    user_data[m.from_user.id] = {"url": m.text}
-
-    kb = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("1080p", callback_data="q_1080"),
-            InlineKeyboardButton("720p", callback_data="q_720")
-        ],
-        [
-            InlineKeyboardButton("480p", callback_data="q_480"),
-            InlineKeyboardButton("Best", callback_data="q_best")
-        ]
-    ])
-
-    await m.reply("🎞 Select quality:", reply_markup=kb)
-
-# ─── QUALITY SELECT ───────────────────────────────────────
-@bot.on_callback_query(filters.regex("^q_"))
-async def quality_select(_, c):
-    q = c.data.split("_")[1]
-    user_data[c.from_user.id]["quality"] = q
-    await c.message.edit_text("✏️ Send file name (without .mp4):")
-
-# ─── FILE NAME ────────────────────────────────────────────
-@bot.on_message(filters.text & ~filters.command)
-async def filename_handler(_, m):
+async def text_handler(_, m):
     uid = m.from_user.id
-    if uid not in user_data or "quality" not in user_data[uid]:
+    text = m.text.strip()
+
+    # Step 1: URL
+    if uid not in user_state:
+        user_state[uid] = {"url": text}
+
+        kb = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("1080p", callback_data="q_1080"),
+                InlineKeyboardButton("720p", callback_data="q_720")
+            ],
+            [
+                InlineKeyboardButton("480p", callback_data="q_480"),
+                InlineKeyboardButton("Best", callback_data="q_best")
+            ]
+        ])
+
+        await m.reply("🎞 Select quality:", reply_markup=kb)
         return
 
-    user_data[uid]["name"] = re.sub(r"[^\w\s-]", "", m.text)
-    await m.reply("⏳ Download started...")
-    await download_and_upload(m)
+    # Step 3: Filename
+    if user_state[uid].get("awaiting_name"):
+        name = re.sub(r"[^\w\s-]", "", text)
+        user_state[uid]["name"] = name
+        user_state[uid]["awaiting_name"] = False
+        await m.reply("⏳ Download started...")
+        await download_and_upload(m)
 
-# ─── DOWNLOAD + UPLOAD ────────────────────────────────────
+# ─── QUALITY CALLBACK ──────────────────────────────────
+@bot.on_callback_query(filters.regex("^q_"))
+async def quality_handler(_, c):
+    uid = c.from_user.id
+    quality = c.data.split("_")[1]
+
+    if uid not in user_state:
+        await c.answer("Send URL first", show_alert=True)
+        return
+
+    user_state[uid]["quality"] = quality
+    user_state[uid]["awaiting_name"] = True
+
+    await c.message.edit_text("✏️ Send file name (without .mp4):")
+
+# ─── DOWNLOAD + UPLOAD ─────────────────────────────────
 async def download_and_upload(m):
     uid = m.from_user.id
-    data = user_data[uid]
+    data = user_state[uid]
 
     url = data["url"]
     quality = data["quality"]
     name = data["name"]
-    out = f"{DOWNLOAD_DIR}/{uid}.mp4"
 
-    scale = {
+    output = f"{DOWNLOAD_DIR}/{uid}.mp4"
+
+    scale_map = {
         "1080": "scale=1920:1080",
         "720": "scale=1280:720",
         "480": "scale=854:480",
         "best": None
-    }[quality]
+    }
 
     cmd = ["ffmpeg", "-y", "-i", url]
-    if scale:
-        cmd += ["-vf", scale]
-    cmd += ["-c:a", "copy", out]
+    if scale_map[quality]:
+        cmd += ["-vf", scale_map[quality]]
+    cmd += ["-c:a", "copy", output]
 
     status = await m.reply("📥 Downloading: 0%")
 
@@ -115,15 +131,15 @@ async def download_and_upload(m):
         if not line:
             break
 
-        if "Duration" in line:
+        if "Duration" in line and not duration:
             t = line.split("Duration:")[1].split(",")[0]
-            h, m_, s = t.split(":")
-            duration = int(h)*3600 + int(m_)*60 + int(float(s))
+            h, mi, s = t.split(":")
+            duration = int(h) * 3600 + int(mi) * 60 + int(float(s))
 
         if "time=" in line and duration:
             cur = line.split("time=")[1].split(" ")[0]
-            h, m_, s = cur.split(":")
-            sec = int(h)*3600 + int(m_)*60 + int(float(s))
+            h, mi, s = cur.split(":")
+            sec = int(h) * 3600 + int(mi) * 60 + int(float(s))
             percent = min(int(sec * 100 / duration), 100)
             await status.edit_text(f"📥 Downloading: {percent}%")
 
@@ -136,18 +152,26 @@ async def download_and_upload(m):
         await status.edit_text(f"📤 Uploading: {percent}%")
 
     await m.reply_video(
-        out,
+        output,
         file_name=f"{name}.mp4",
         progress=progress
     )
 
-    os.remove(out)
-    user_data.pop(uid, None)
+    if os.path.exists(output):
+        os.remove(output)
 
-# ─── RUN ─────────────────────────────────────────────────
-def run_bot():
-    bot.run()
+    user_state.pop(uid, None)
+
+# ─── RUN ───────────────────────────────────────────────
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    # Flask in background
+    threading.Thread(target=run_flask).start()
+
+    # Proper asyncio loop for Pyrogram
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    bot.run()
